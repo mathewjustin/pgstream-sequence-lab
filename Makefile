@@ -1,4 +1,7 @@
-.PHONY: baseline fixed test clean logs
+.PHONY: demo baseline fixed test clean logs
+
+demo:
+	./demo.sh
 
 baseline:
 	./scripts/run.sh baseline

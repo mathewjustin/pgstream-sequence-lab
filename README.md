@@ -28,6 +28,25 @@ The baseline writer copies IDs 1001 through 1500 but does not recognize the expl
 
 The fixed writer discovers the sequence through the column default's `pg_attrdef -> pg_depend -> pg_class` relationship. pgstream's existing DML adapter then emits `setval` alongside the replicated inserts. The target sequence reaches 1500, and the target-side insert safely receives 1501.
 
+## Quick demo
+
+Run the complete broken scenario with one command:
+
+```bash
+./demo.sh
+```
+
+The script starts both databases and Kafka, takes the initial snapshot, replicates 500 rows, prints a real CDC event from Kafka, and shows the actual duplicate-key error from the target.
+
+To see the fixed behavior, or compare both runs:
+
+```bash
+./demo.sh fixed
+./demo.sh both
+```
+
+The first build downloads and compiles pgstream, so later runs are much faster.
+
 ## Run it
 
 Requirements: Docker with Compose and about 1.5 GB of free memory.

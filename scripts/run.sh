@@ -12,6 +12,19 @@ fi
 
 writer_service="kafka2pg-$VARIANT"
 
+compose_step() {
+  if [[ "${LAB_QUIET:-0}" == "1" ]]; then
+    local output
+    if ! output=$("${COMPOSE[@]}" "$@" 2>&1); then
+      printf '%s\n' "$output" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  "${COMPOSE[@]}" "$@"
+}
+
 sql_value() {
   local service=$1
   local sql=$2
@@ -42,10 +55,14 @@ echo "==> Resetting the lab"
 "${COMPOSE[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
 
 echo "==> Building PostgreSQL and pgstream ($VARIANT writer)"
-"${COMPOSE[@]}" build source pg2kafka "$writer_service"
+if [[ "${LAB_QUIET:-0}" == "1" ]]; then
+  compose_step build --quiet source pg2kafka "$writer_service"
+else
+  compose_step build source pg2kafka "$writer_service"
+fi
 
 echo "==> Starting two PostgreSQL databases and Kafka"
-"${COMPOSE[@]}" up -d --wait source target kafka
+compose_step up -d --wait source target kafka
 
 echo "==> Creating the one-partition Kafka topic"
 "${COMPOSE[@]}" exec -T kafka /opt/kafka/bin/kafka-topics.sh \
@@ -71,7 +88,7 @@ if [[ "$source_snapshot" != "1000:1000" || "$target_snapshot" != "1000:1000" ]];
 fi
 
 echo "==> Starting source -> Kafka -> target CDC"
-"${COMPOSE[@]}" up -d pg2kafka "$writer_service"
+compose_step up -d pg2kafka "$writer_service"
 wait_for_value source "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pgstream_sequence_lab_slot';" "1" "the pgstream replication slot"
 
 echo "==> Inserting 500 additional rows at the source"
@@ -79,8 +96,21 @@ sql_value source "INSERT INTO lab.events (payload) SELECT 'cdc-' || value FROM g
 
 wait_for_value target "SELECT count(*) FROM lab.events;" "1500" "1,500 rows at the target"
 
+if [[ "${SHOW_KAFKA_EVENT:-0}" == "1" ]]; then
+  echo
+  echo "First CDC event stored in Kafka:"
+  kafka_event=$("${COMPOSE[@]}" exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server localhost:9092 \
+    --topic pgstream-sequence-lab \
+    --from-beginning \
+    --max-messages 1 \
+    --timeout-ms 10000 2>/dev/null)
+  printf '%s\n' "$kafka_event"
+  echo
+fi
+
 echo "==> Stopping CDC and testing a target-side default insert"
-"${COMPOSE[@]}" stop pg2kafka "$writer_service" >/dev/null
+compose_step stop pg2kafka "$writer_service"
 
 source_state=$(sql_value source "SELECT max(id) || ':' || (SELECT last_value FROM lab.id_sequence) FROM lab.events;")
 target_state=$(sql_value target "SELECT max(id) || ':' || (SELECT last_value FROM lab.id_sequence) FROM lab.events;")
@@ -106,7 +136,11 @@ if [[ "$VARIANT" == "baseline" ]]; then
     echo "$cutover_output" >&2
     exit 1
   fi
-  echo "Target default insert:    expected duplicate-key failure on id 1001"
+  echo "Target default insert output:"
+  while IFS= read -r line; do
+    printf '  %s\n' "$line"
+  done <<< "$cutover_output"
+  echo "Result:                   expected duplicate-key failure on id 1001"
   echo "PASS: issue #1203 reproduced"
 else
   if [[ "$source_state" != "1500:1500" || "$target_state" != "1500:1500" ]]; then
@@ -118,7 +152,8 @@ else
     echo "$cutover_output" >&2
     exit 1
   fi
-  echo "Target default insert:    succeeded with id $cutover_output"
+  echo "Target default insert output: $cutover_output"
+  echo "Result:                   succeeded with id 1501"
   echo "PASS: patch prevents the cutover collision"
 fi
 
