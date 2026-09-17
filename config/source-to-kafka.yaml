@@ -1,0 +1,19 @@
+source:
+  postgres:
+    url: "postgres://postgres:postgres@source:5432/lab?sslmode=disable"
+    mode: replication
+    replication:
+      replication_slot: pgstream_sequence_lab_slot
+
+target:
+  kafka:
+    servers: ["kafka:9092"]
+    topic:
+      name: pgstream-sequence-lab
+      partitions: 1
+      replication_factor: 1
+      auto_create: true
+    batch:
+      timeout: 100
+      size: 100
+      max_bytes: 1572864

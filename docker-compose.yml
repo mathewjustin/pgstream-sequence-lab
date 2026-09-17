@@ -1,0 +1,147 @@
+name: pgstream-sequence-lab
+
+x-postgres-environment: &postgres-environment
+  POSTGRES_DB: lab
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+
+x-postgres-healthcheck: &postgres-healthcheck
+  test: ["CMD-SHELL", "pg_isready -U postgres -d lab"]
+  interval: 2s
+  timeout: 3s
+  retries: 30
+
+services:
+  source:
+    build:
+      context: ./db
+    image: pgstream-sequence-lab-postgres:16.11
+    environment: *postgres-environment
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+    ports:
+      - "${SOURCE_PORT:-55432}:5432"
+    healthcheck: *postgres-healthcheck
+    volumes:
+      - source-data:/var/lib/postgresql/data
+
+  target:
+    build:
+      context: ./db
+    image: pgstream-sequence-lab-postgres:16.11
+    environment: *postgres-environment
+    ports:
+      - "${TARGET_PORT:-55433}:5432"
+    healthcheck: *postgres-healthcheck
+    volumes:
+      - target-data:/var/lib/postgresql/data
+
+  kafka:
+    image: apache/kafka:4.3.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx256m
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  pg2kafka:
+    build:
+      context: .
+      dockerfile: Dockerfile.pgstream
+      args:
+        PGSTREAM_REF: v1.3.1
+        APPLY_FIX: "0"
+    image: pgstream-sequence-lab-pgstream:baseline
+    command: ["run", "-c", "/config/source-to-kafka.yaml", "--init", "--log-level", "info"]
+    depends_on:
+      source:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./config:/config:ro
+
+  kafka2pg-baseline:
+    image: pgstream-sequence-lab-pgstream:baseline
+    command: ["run", "--log-level", "info"]
+    environment:
+      PGSTREAM_KAFKA_READER_SERVERS: kafka:9092
+      PGSTREAM_KAFKA_TOPIC_NAME: pgstream-sequence-lab
+      PGSTREAM_KAFKA_READER_CONSUMER_GROUP_ID: pgstream-sequence-lab-consumer
+      PGSTREAM_KAFKA_READER_CONSUMER_GROUP_START_OFFSET: earliest
+      PGSTREAM_KAFKA_COMMIT_BACKOFF_INITIAL_INTERVAL: 250ms
+      PGSTREAM_KAFKA_COMMIT_BACKOFF_MAX_INTERVAL: 5s
+      PGSTREAM_KAFKA_COMMIT_BACKOFF_MAX_RETRIES: 60
+      PGSTREAM_POSTGRES_WRITER_TARGET_URL: "postgres://postgres:postgres@target:5432/lab?sslmode=disable"
+      PGSTREAM_POSTGRES_WRITER_BATCH_TIMEOUT: 250ms
+      PGSTREAM_POSTGRES_WRITER_BATCH_SIZE: 100
+      PGSTREAM_POSTGRES_WRITER_DISABLE_TRIGGERS: "false"
+      PGSTREAM_POSTGRES_WRITER_ON_CONFLICT_ACTION: error
+      PGSTREAM_INJECTOR_STORE_POSTGRES_URL: "postgres://postgres:postgres@source:5432/lab?sslmode=disable"
+    depends_on:
+      source:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  kafka2pg-fixed:
+    build:
+      context: .
+      dockerfile: Dockerfile.pgstream
+      args:
+        PGSTREAM_REF: v1.3.1
+        APPLY_FIX: "1"
+    image: pgstream-sequence-lab-pgstream:fixed
+    command: ["run", "--log-level", "info"]
+    environment:
+      PGSTREAM_KAFKA_READER_SERVERS: kafka:9092
+      PGSTREAM_KAFKA_TOPIC_NAME: pgstream-sequence-lab
+      PGSTREAM_KAFKA_READER_CONSUMER_GROUP_ID: pgstream-sequence-lab-consumer
+      PGSTREAM_KAFKA_READER_CONSUMER_GROUP_START_OFFSET: earliest
+      PGSTREAM_KAFKA_COMMIT_BACKOFF_INITIAL_INTERVAL: 250ms
+      PGSTREAM_KAFKA_COMMIT_BACKOFF_MAX_INTERVAL: 5s
+      PGSTREAM_KAFKA_COMMIT_BACKOFF_MAX_RETRIES: 60
+      PGSTREAM_POSTGRES_WRITER_TARGET_URL: "postgres://postgres:postgres@target:5432/lab?sslmode=disable"
+      PGSTREAM_POSTGRES_WRITER_BATCH_TIMEOUT: 250ms
+      PGSTREAM_POSTGRES_WRITER_BATCH_SIZE: 100
+      PGSTREAM_POSTGRES_WRITER_DISABLE_TRIGGERS: "false"
+      PGSTREAM_POSTGRES_WRITER_ON_CONFLICT_ACTION: error
+      PGSTREAM_INJECTOR_STORE_POSTGRES_URL: "postgres://postgres:postgres@source:5432/lab?sslmode=disable"
+    depends_on:
+      source:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+volumes:
+  source-data:
+  target-data:
+  kafka-data:

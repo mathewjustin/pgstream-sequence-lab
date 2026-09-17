@@ -1,0 +1,21 @@
+FROM golang:1.26.3-alpine AS builder
+
+ARG PGSTREAM_REF=v1.3.1
+ARG APPLY_FIX=0
+
+RUN apk add --no-cache build-base git
+
+WORKDIR /src
+RUN git clone --branch "${PGSTREAM_REF}" --depth 1 https://github.com/xataio/pgstream.git .
+
+COPY patches/1203-explicit-sequence.patch /tmp/1203-explicit-sequence.patch
+RUN if [ "${APPLY_FIX}" = "1" ]; then git apply --check /tmp/1203-explicit-sequence.patch && git apply /tmp/1203-explicit-sequence.patch; fi
+
+RUN CGO_ENABLED=0 go build -trimpath -o /out/pgstream .
+
+FROM alpine:3.23
+
+RUN apk add --no-cache ca-certificates tzdata
+COPY --from=builder /out/pgstream /usr/local/bin/pgstream
+
+ENTRYPOINT ["/usr/local/bin/pgstream"]
