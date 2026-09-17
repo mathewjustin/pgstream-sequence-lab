@@ -73,12 +73,165 @@ For a standalone sequence referenced only by a default:
 column default (pg_attrdef) -- normal dependency ('n') --> sequence
 ```
 
+### See the difference in PostgreSQL
+
+Create one owned sequence example beside the lab's explicit sequence:
+
+```sql
+CREATE TABLE lab.owned_example (
+    id bigserial PRIMARY KEY
+);
+```
+
+PostgreSQL's `pg_get_serial_sequence` function returns a sequence only when it is owned by the column:
+
+```sql
+SELECT
+    'lab.events' AS table_name,
+    COALESCE(
+        pg_get_serial_sequence('lab.events', 'id'),
+        'NULL (not owned)'
+    ) AS owned_sequence
+UNION ALL
+SELECT
+    'lab.owned_example',
+    COALESCE(
+        pg_get_serial_sequence('lab.owned_example', 'id'),
+        'NULL (not owned)'
+    );
+```
+
+```text
+    table_name     |      owned_sequence
+-------------------+--------------------------
+ lab.events        | NULL (not owned)
+ lab.owned_example | lab.owned_example_id_seq
+(2 rows)
+```
+
+The explicit sequence is still a real dependency, but it belongs to the column's default expression:
+
+```sql
+SELECT
+    ad.adrelid::regclass AS table_name,
+    a.attname AS column_name,
+    d.deptype,
+    d.classid::regclass AS dependent_catalog,
+    d.refobjid::regclass AS referenced_object
+FROM pg_depend d
+JOIN pg_attrdef ad
+    ON d.classid = 'pg_attrdef'::regclass
+    AND d.objid = ad.oid
+JOIN pg_attribute a
+    ON a.attrelid = ad.adrelid
+    AND a.attnum = ad.adnum
+WHERE d.refclassid = 'pg_class'::regclass
+    AND d.refobjid = 'lab.id_sequence'::regclass;
+```
+
+```text
+ table_name | column_name | deptype | dependent_catalog | referenced_object
+------------+-------------+---------+-------------------+-------------------
+ lab.events | id          | n       | pg_attrdef        | lab.id_sequence
+(1 row)
+```
+
+Here `deptype = 'n'` means a normal dependency. Read the row as:
+
+```text
+the pg_attrdef for lab.events.id depends on lab.id_sequence
+```
+
+By comparison, the `bigserial` example has the ownership relationship the old pgstream query expected:
+
+```sql
+SELECT
+    s.oid::regclass AS sequence_name,
+    t.oid::regclass AS table_name,
+    a.attname AS column_name,
+    d.deptype
+FROM pg_depend d
+JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+JOIN pg_class t ON t.oid = d.refobjid
+JOIN pg_attribute a
+    ON a.attrelid = t.oid
+    AND a.attnum = d.refobjsubid
+WHERE d.deptype = 'a'
+    AND t.oid = 'lab.owned_example'::regclass;
+```
+
+```text
+      sequence_name       |    table_name     | column_name | deptype
+--------------------------+-------------------+-------------+---------
+ lab.owned_example_id_seq | lab.owned_example | id          | a
+(1 row)
+```
+
+Here `deptype = 'a'` is the automatic ownership dependency:
+
+```text
+lab.owned_example_id_seq is owned by lab.owned_example.id
+```
+
 The original pgstream query only followed the first relationship:
 
 ```sql
 d.refobjid = table_oid
 AND d.refobjsubid = column_number
 AND d.deptype = 'a'
+```
+
+Running that lookup for the lab table demonstrates the miss:
+
+```sql
+SELECT s.oid::regclass AS sequence_name
+FROM pg_depend d
+JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+WHERE d.refobjid = 'lab.events'::regclass
+    AND d.refobjsubid = (
+        SELECT attnum
+        FROM pg_attribute
+        WHERE attrelid = 'lab.events'::regclass
+            AND attname = 'id'
+    )
+    AND d.deptype = 'a';
+```
+
+```text
+ sequence_name
+---------------
+(0 rows)
+```
+
+The fixed lookup starts from `pg_attrdef`, follows its dependency to the sequence, and finds the missing mapping:
+
+```sql
+SELECT
+    a.attname AS column_name,
+    sn.nspname || '.' || s.relname AS sequence_name
+FROM pg_class t
+JOIN pg_namespace tn ON tn.oid = t.relnamespace
+JOIN pg_attribute a ON a.attrelid = t.oid
+JOIN pg_attrdef ad
+    ON ad.adrelid = t.oid
+    AND ad.adnum = a.attnum
+JOIN pg_depend d
+    ON d.classid = 'pg_attrdef'::regclass
+    AND d.objid = ad.oid
+    AND d.refclassid = 'pg_class'::regclass
+JOIN pg_class s ON s.oid = d.refobjid AND s.relkind = 'S'
+JOIN pg_namespace sn ON sn.oid = s.relnamespace
+WHERE tn.nspname = 'lab'
+    AND t.relname = 'events'
+    AND pg_get_expr(ad.adbin, ad.adrelid)
+        = format('nextval(%L::regclass)', s.oid::regclass::text);
+```
+
+```text
+ column_name |  sequence_name
+-------------+-----------------
+ id          | lab.id_sequence
+(1 row)
 ```
 
 Our test schema uses the second form:
