@@ -2,7 +2,7 @@
 
 A small, reproducible lab for [xataio/pgstream issue #1203](https://github.com/xataio/pgstream/issues/1203). It demonstrates why an explicit PostgreSQL sequence can fall behind after CDC, and validates a candidate fix against the same workload.
 
-For a concise explanation of pgstream's internal sequence handling, the catalog dependency that caused the bug, and how the fix works, see [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md).
+For a concise explanation of pgstream's internal sequence handling, the two paths that populate its sequence cache, the catalog dependency that caused the bug, and the DDL refresh corner case found during review, see [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md).
 
 ## What the lab proves
 

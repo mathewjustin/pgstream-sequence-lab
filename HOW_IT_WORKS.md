@@ -40,6 +40,162 @@ Target setval('lab.id_sequence', 1001, true)
 
 For a batch of inserts, pgstream uses the largest observed value and emits one `setval` per sequence.
 
+## The schema observer has two sequence-metadata paths
+
+The PostgreSQL writer does not inspect the database catalogs for every row. Its
+schema observer keeps a cache shaped like this:
+
+```text
+schema.table -> column -> qualified sequence
+
+"lab"."events" -> "id" -> "lab"."id_sequence"
+```
+
+There are two different paths that can populate or replace that cache:
+
+```mermaid
+flowchart TD
+    DML[CDC row event] --> Lookup{Sequence cache entry<br/>for this table?}
+
+    Lookup -->|No| Catalog[Path 1: queryTableSequences]
+    Catalog --> Defaults[Direct DEFAULT nextval<br/>pg_attrdef dependency n]
+    Catalog --> Identity[Identity sequence<br/>pg_depend dependency i]
+    Defaults --> Store[Store column-to-sequence map]
+    Identity --> Store
+
+    Lookup -->|Yes| Use[Use cached map]
+    Store --> Use
+    Use --> Writer[Build target INSERT]
+    Writer --> Setval[Emit setval for mapped columns]
+
+    DDL[DDL event such as ALTER TABLE] --> Refresh[Path 2: updateColumnSequences]
+    Refresh --> EventMetadata[Read columns from DDL metadata]
+    EventMetadata --> HasDefault{Direct nextval default?}
+    HasDefault -->|Yes| Replace[Replace cache map]
+    HasDefault -->|No: identity default is null| Lost[Identity mapping omitted]
+    Lost --> Replace
+    Replace --> Lookup
+```
+
+The important design detail is that these paths are **two writers to the same
+cache**. Correctness therefore requires both paths to recognize the same kinds
+of sequence-backed columns.
+
+### Path 1: lazy catalog discovery
+
+When a row arrives and the table has no cache entry, `getSequenceColumns` calls
+`queryTableSequences`. The query inspects the target PostgreSQL catalogs and
+stores the result:
+
+```text
+cache miss
+    -> query pg_attribute / pg_attrdef / pg_depend / pg_class
+    -> discover "id" -> "lab"."id_sequence"
+    -> cache the mapping
+    -> build INSERT and setval
+```
+
+The candidate fix in this lab changes this path. These are the relevant catalog
+relationships:
+
+| Column form | Relationships stored by PostgreSQL | Edge followed by the fixed query |
+| --- | --- | --- |
+| `serial` or an owned sequence with a direct default | default to sequence (`n`), plus sequence ownership (`a`) | default to sequence (`n`) |
+| unowned direct `DEFAULT nextval(...)` | default to sequence (`n`) only | default to sequence (`n`) |
+| `GENERATED ... AS IDENTITY` | internal sequence-to-column relationship (`i`), without an ordinary default | internal relationship (`i`) |
+
+The old query followed only the ownership edge (`a`). Issue #1203 is the second
+row, where that edge does not exist. The PR follows the direct-default edge (`n`)
+and separately preserves identity discovery through the internal edge (`i`).
+
+### Path 2: eager refresh after a DDL event
+
+When pgstream observes a DDL event, it does not wait for a cache miss. It calls
+`updateColumnSequences` and rebuilds the map from the columns carried in the DDL
+event.
+
+For an ordinary direct default, that event contains data resembling:
+
+```json
+{
+  "name": "id",
+  "default": "nextval('lab.id_sequence'::regclass)",
+  "identity": null
+}
+```
+
+`DDLColumn.HasSequence()` parses `default`, finds `nextval(...)`, and retains the
+mapping.
+
+An identity column is represented differently:
+
+```json
+{
+  "name": "id",
+  "default": null,
+  "identity": "ALWAYS"
+}
+```
+
+PostgreSQL records the identity marker in `pg_attribute.attidentity` and the
+backing sequence relationship as an internal `pg_depend` entry. It does not put
+an ordinary default for the identity column in `pg_attrdef`. Consequently:
+
+```text
+Default == nil
+    -> GetSequenceName() returns ""
+    -> HasSequence() returns false
+    -> updateColumnSequences omits the identity column
+```
+
+Worse, the observer stores the rebuilt empty map. A later row sees a successful
+cache hit with `{}` and does not retry the corrected catalog query from Path 1.
+
+### The review corner case as cache states
+
+Assume Path 1 has already discovered the identity sequence:
+
+```text
+Before DDL:
+"public"."orders" -> { "id": "public"."orders_id_seq" }
+```
+
+Now the source executes an unrelated schema change:
+
+```sql
+ALTER TABLE public.orders ADD COLUMN note text;
+```
+
+The DDL event includes `id` with `identity = "ALWAYS"` and `default = null`.
+Path 2 reconstructs and replaces the cache:
+
+```text
+After DDL:
+"public"."orders" -> {}
+```
+
+The SQL in Path 1 is correct, but it is no longer reached because the empty map
+is still a cache entry. This is the lifecycle corner case identified during PR
+review.
+
+### Why the original lab did not reveal Path 2
+
+The current `demo.sh` workload creates the table before streaming, snapshots it,
+and then sends only row inserts during CDC. That is exactly the Path 1 scenario:
+
+```text
+empty observer cache -> first row -> catalog query -> cached mapping
+```
+
+It never performs an `ALTER TABLE` after streaming starts, so
+`updateColumnSequences` never replaces the mapping. The lab proved that the new
+catalog query fixes issue #1203, but it did not yet prove that the mapping
+survives the complete schema-observer lifecycle.
+
+That distinction is useful when testing cache-backed systems: test both the
+cache-miss loader and every path that refreshes, replaces, or invalidates the
+same cache entry.
+
 ## Why the snapshot worked
 
 `pg_dump` handles sequence state separately from table rows. After dumping the first 1,000 rows, it restores the equivalent of:
