@@ -186,22 +186,71 @@ and which types need special handling. Those facts are **schema metadata**.
 
 ### Where it fits inside the writer
 
-```text
-Kafka event arrives at the pgstream writer
-    |
-    v
-Event adapter: is this a row change or a schema change?
-    |
-    +-- Row change (DML)
-    |     -> ask schema observer for table metadata
-    |     -> DML adapter uses that metadata to build SQL
-    |     -> writer executes the SQL on target PostgreSQL
-    |
-    +-- Schema change (DDL)
-          -> update or invalidate observer metadata
-          -> prepare target DDL when DDL execution is enabled
-          -> writer executes the prepared DDL
+```mermaid
+flowchart TB
+    Event["Incoming event from Kafka"]:::input
+
+    subgraph Writer["Inside the pgstream PostgreSQL writer process"]
+        Route{"Row change or<br/>schema change?"}:::decision
+        Row["DML: row values<br/>Example: id = 1001"]:::input
+        DDL["DDL: schema event<br/>Example: ALTER TABLE"]:::schema
+
+        subgraph Observer["SCHEMA OBSERVER · the writer's metadata notebook"]
+            Lookup{"Sequence entry<br/>already cached?"}:::decision
+            Discover["Discover from target catalogs<br/>PR fix: recognize direct-default<br/>and identity relationships"]:::fix
+            Cache[("In-memory metadata caches<br/>Sequences · generated columns<br/>Identity columns · enums · views")]:::cache
+            Refresh["Process schema-event metadata<br/>Refresh or invalidate caches<br/>Review concern: identity sequence mapping"]:::schema
+            Info["Return table metadata<br/>Example: id → lab.id_sequence"]:::metadata
+
+            Lookup -->|"No: cache miss"| Discover
+            Discover -->|"Save discovered mapping"| Cache
+            Lookup -->|"Yes: reuse entry"| Cache
+            Cache -->|"Read metadata"| Info
+            Refresh -.->|"Update cached knowledge"| Cache
+        end
+
+        Build["DML adapter builds SQL<br/>Explicit-ID INSERT + mapped setval"]:::action
+        DDLBuild["Prepare DDL SQL<br/>when DDL execution is enabled"]:::schema
+        Execute["Writer executes prepared SQL"]:::action
+
+        Route -->|"Data changed"| Row
+        Route -->|"Structure changed"| DDL
+        Row -->|"Request table metadata"| Lookup
+        Row -->|"Supply row values"| Build
+        DDL --> Refresh
+        Refresh --> DDLBuild
+        Info -->|"Guide SQL construction"| Build
+        Build --> Execute
+        DDLBuild --> Execute
+    end
+
+    Target[("Target PostgreSQL<br/>System catalogs · tables · sequences")]:::database
+    Event --> Route
+    Discover -.->|"Read catalog relationships"| Target
+    Execute -->|"Apply SQL"| Target
+
+    classDef input fill:#dbeafe,stroke:#2563eb,color:#172554,stroke-width:2px
+    classDef decision fill:#fef3c7,stroke:#d97706,color:#78350f,stroke-width:2px
+    classDef schema fill:#ffedd5,stroke:#ea580c,color:#7c2d12,stroke-width:2px
+    classDef fix fill:#ffe4e6,stroke:#e11d48,color:#881337,stroke-width:3px
+    classDef cache fill:#ede9fe,stroke:#7c3aed,color:#3b0764,stroke-width:2px
+    classDef metadata fill:#e0e7ff,stroke:#4f46e5,color:#312e81,stroke-width:2px
+    classDef action fill:#ccfbf1,stroke:#0d9488,color:#134e4a,stroke-width:2px
+    classDef database fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
+    style Writer fill:#f8fafc,stroke:#64748b,stroke-width:2px,color:#0f172a
+    style Observer fill:#faf5ff,stroke:#9333ea,stroke-width:2px,color:#581c87
 ```
+
+**Read the blue row path first:** row values and observer metadata meet at
+the DML adapter, which builds SQL for the writer to execute. The pink box
+marks the discovery code changed by the original fix. The orange path shows
+how schema events can change that same cached knowledge.
+
+This diagram expands the **sequence lookup** inside the observer; the other
+metadata caches have their own lookup logic. A cached empty sequence map is
+still a “Yes” at the decision, but yields no sequence update. The orange
+refresh happens during event preparation, before target DDL execution; the
+arrows do not imply that schema changes have already been applied.
 
 **DML** means data changes such as `INSERT`, `UPDATE`, and `DELETE`.
 **DDL** means structure changes such as `CREATE TABLE` and `ALTER TABLE`.
