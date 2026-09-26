@@ -40,6 +40,114 @@ Target setval('lab.id_sequence', 1001, true)
 
 For a batch of inserts, pgstream uses the largest observed value and emits one `setval` per sequence.
 
+## Reading this lab as a platform engineer
+
+There are three separate kinds of state to reason about: the replicated rows,
+the metadata used to interpret those rows, and the sequence that will allocate
+the next ID. A healthy row stream does not establish that all three are correct.
+
+The services in [`docker-compose.yml`](docker-compose.yml) divide the work as follows:
+
+| Component | Responsibility in this lab | What its progress does not prove |
+| --- | --- | --- |
+| Source PostgreSQL | Stores rows and exposes changes through a logical replication slot | That the target has applied those changes |
+| `pg2kafka` | Reads source changes and publishes events to Kafka | That the target sequence has advanced |
+| Kafka | Holds the event stream in the single `pgstream-sequence-lab` partition | That a target-side default will generate an unused ID |
+| `kafka2pg-baseline` or `kafka2pg-fixed` | Reads events, resolves schema metadata, and builds target SQL | That metadata remains correct after every schema change |
+| Target PostgreSQL | Executes explicit row writes and the writer's separate sequence updates | That matching row counts imply readiness for application writes |
+
+Both pgstream processes run the same executable with different configurations.
+Only the fixed **target writer** receives the candidate patch; the source reader
+remains baseline. The target writer also has a source connection configured for
+the metadata injector. Do not confuse that with sequence catalog discovery:
+the PostgreSQL writer's schema observer queries the **target** database.
+
+For an insert, the useful code-reading path is:
+
+```text
+row event -> schema observer -> schemaInfo.sequenceColumns
+          -> DML adapter -> explicit INSERT + optional setval
+          -> execution on target PostgreSQL
+```
+
+The adapter uses `OVERRIDING SYSTEM VALUE` so an insert can preserve a source
+value even for `GENERATED ALWAYS AS IDENTITY`. Accepting that explicit value
+and advancing the backing sequence are still separate operations. In the
+version used here, the sequence updates are built on the INSERT path; they
+are not a general-purpose mirror of every source sequence operation.
+
+### What a passing run establishes
+
+[`scripts/run.sh`](scripts/run.sh) performs the snapshot with external
+`pg_dump` and `psql` commands. It is not exercising pgstream's own snapshot
+implementation. Source writes are deliberately idle between that snapshot and
+CDC startup. A production migration with concurrent writes needs a coordinated
+snapshot and stream position; copying this script's timing alone would leave
+a window for missed changes. PostgreSQL describes the coordinated mechanism
+under [exported snapshots](https://www.postgresql.org/docs/16/logicaldecoding-explanation.html#LOGICALDECODING-EXPLANATION-EXPORTSNAPSHOT).
+
+The lab then checks three distinct outcomes:
+
+1. The target contains the expected 1,500 rows.
+2. Its sequence has reached the expected value before cutover.
+3. After CDC stops, an insert that omits `id` succeeds with 1501.
+
+The baseline passes the first check and fails the other two. That is why this
+bug can stay hidden until an application begins writing to the target.
+
+The patched run covers one ascending sequence, one table, one Kafka partition,
+and no concurrent target application writes. It does not establish correctness
+for identity columns after DDL, crash/replay behavior, shared sequences across
+tables, descending sequences, or concurrent source and target writers. The
+DDL cache issue below is a source-code/review finding, not a scenario currently
+executed by `demo.sh`.
+
+### Sequence state is not a row count or a replication checkpoint
+
+`setval(sequence, 1500, true)` means the next call advances first: with this
+lab's increment of one, it returns 1501. With `false`, the next call returns
+1500. Read `is_called` together with `last_value` when inspecting a sequence.
+
+Sequence operations are not rolled back like table writes. A failed insert
+can consume an ID, and rolling back `setval` does not restore the previous
+state. Consequently, gaps do not by themselves indicate lost rows. See
+[PostgreSQL sequence semantics](https://www.postgresql.org/docs/16/functions-sequence.html).
+
+The bulk adapter takes the maximum **within the supplied insert events**. It
+does not compare that maximum with the sequence's current target value before
+issuing `setval`. Do not interpret this as a guarantee that the sequence can
+never move backward across batches or concurrent writers. The discovery patch
+does not change that behavior.
+
+### Inspect without consuming an ID
+
+From this lab directory, with the database containers running, use the same
+read-only query on each side:
+
+```bash
+docker compose exec -T source psql -X -U postgres -d lab -c \
+  'SELECT count(*) AS rows, max(id) AS max_id FROM lab.events; SELECT last_value, is_called FROM lab.id_sequence;'
+docker compose exec -T target psql -X -U postgres -d lab -c \
+  'SELECT count(*) AS rows, max(id) AS max_id FROM lab.events; SELECT last_value, is_called FROM lab.id_sequence;'
+```
+
+Do not use `nextval` as a read-only probe: it changes the state being inspected.
+Also distinguish the script's printed **before-cutover** state from a query
+run after it finishes. The baseline's failed cutover insert has already consumed
+1001; the fixed run has inserted row 1501 and advanced its sequence to 1501.
+
+For source retention, inspect the replication slot separately:
+
+```bash
+docker compose exec -T source psql -X -U postgres -d lab -c \
+  "SELECT slot_name, active, restart_lsn, confirmed_flush_lsn, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal_distance FROM pg_replication_slots WHERE slot_name = 'pgstream_sequence_lab_slot';"
+```
+
+That WAL distance is an indicator of the slot's retention position, not an
+exact disk-usage measurement or proof of target application. An inactive slot
+can still retain WAL; monitor this separately from Kafka consumer lag and
+target correctness. See [logical replication slots](https://www.postgresql.org/docs/16/logicaldecoding-explanation.html#LOGICALDECODING-REPLICATION-SLOTS).
+
 ## The schema observer has two sequence-metadata paths
 
 The PostgreSQL writer does not inspect the database catalogs for every row. Its
