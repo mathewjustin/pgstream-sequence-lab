@@ -47,6 +47,51 @@ To see the fixed behavior, or compare both runs:
 
 The first build downloads and compiles pgstream, so later runs are much faster.
 
+## Separate reproduction: identity columns after DDL
+
+To exercise the review concern in PR #1212 using the **existing patched writer**:
+
+```bash
+bash scripts/reproduce-identity-ddl.sh
+```
+
+This creates a separate Compose project, `pgstream-identity-ddl-lab`, with its
+own volumes and source/target ports `55442` / `55443`. It does not reset the
+original sequence lab. Existing lab images are reused; missing images are
+built. Set `LAB_BUILD=1` to request a build explicitly. Custom ports can be
+set with `IDENTITY_SOURCE_PORT` and `IDENTITY_TARGET_PORT`.
+
+The script snapshots an identity table, replicates a row, adds an unrelated
+column with real source-side `ALTER TABLE`, and replicates another row. Gaps
+between source IDs expose accidental target-side ID generation:
+
+| Phase | Source row ID / sequence | Target row ID / sequence |
+| --- | --- | --- |
+| Before DDL | 1001 / 1001 | 1001 / 1001 |
+| After DDL | 2001 / 2001 | **1002 / 1002** |
+| After restarting only the writer | 3001 / 3001 | 3001 / 3001 |
+
+`PASS` means **the known bug was reproduced**, not that replication is correct.
+Any mismatch with the expected bug signature exits nonzero. The restart
+demonstrates fresh-cache behavior; it does not repair the already miscopied row
+and is not a migration fix. No extra pgstream patch is applied for this test.
+
+The script stops CDC at the end and leaves the databases and Kafka available:
+
+```bash
+SOURCE_PORT=55442 TARGET_PORT=55443 docker compose -p pgstream-identity-ddl-lab exec target psql -U postgres -d lab
+```
+
+It refuses to overwrite an existing identity-DDL lab. To delete **only this
+scenario's test data** before running it again:
+
+```bash
+bash scripts/reproduce-identity-ddl.sh clean
+```
+
+See [the explanation](HOW_IT_WORKS.md#reproduce-the-identity-ddl-path-with-the-current-patch)
+and [captured results](RESULTS.md#identity-ddl-regression-with-the-existing-patch).
+
 ## Run it
 
 Requirements: Docker with Compose and about 1.5 GB of free memory.

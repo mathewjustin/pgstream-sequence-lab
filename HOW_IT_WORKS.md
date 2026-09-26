@@ -99,8 +99,9 @@ The patched run covers one ascending sequence, one table, one Kafka partition,
 and no concurrent target application writes. It does not establish correctness
 for identity columns after DDL, crash/replay behavior, shared sequences across
 tables, descending sequences, or concurrent source and target writers. The
-DDL cache issue below is a source-code/review finding, not a scenario currently
-executed by `demo.sh`.
+DDL cache issue below is not exercised by `demo.sh`. A separate
+[`reproduce-identity-ddl.sh`](scripts/reproduce-identity-ddl.sh) scenario now
+exercises identity behavior after DDL with the same patched writer.
 
 ### Sequence state is not a row count or a replication checkpoint
 
@@ -487,8 +488,9 @@ Consequently, a test after DDL must verify that the target preserves the
 **source row's actual ID**, as well as checking sequence state. Consecutive
 IDs alone can hide the target accidentally generating a matching ID itself.
 
-These are implementation details to account for when designing a fix, not
-additional scenarios already covered by the current lab workload.
+These are implementation details to account for when designing a fix. The
+original `demo.sh` workload does not exercise them; the separate identity-DDL
+script below demonstrates their combined effect on copied row IDs.
 
 ### Local code-reading landmarks
 
@@ -663,6 +665,64 @@ survives the complete schema-observer lifecycle.
 That distinction is useful when testing cache-backed systems: test both the
 cache-miss loader and every path that refreshes, replaces, or invalidates the
 same cache entry.
+
+### Reproduce the identity-DDL path with the current patch
+
+Run this separate scenario from the lab directory:
+
+```bash
+bash scripts/reproduce-identity-ddl.sh
+```
+
+It uses `v1.3.1` with the **same discovery patch** as `demo.sh fixed`. No fix
+for the review concern is applied. It runs under a separate Compose project
+with separate volumes and ports; see the [README](README.md#separate-reproduction-identity-columns-after-ddl)
+for inspection, rebuild, and cleanup commands.
+
+The key SQL is:
+
+```sql
+-- Before streaming: create this table and snapshot its first 10 rows.
+CREATE TABLE lab.identity_events (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    payload text NOT NULL UNIQUE
+);
+
+-- With streaming active: exercise discovery and establish a known target state.
+SELECT setval('lab.identity_events_id_seq', 1000, true);
+INSERT INTO lab.identity_events (payload) VALUES ('before-ddl');
+-- Source and target both have this row at id=1001, sequence=1001.
+
+-- Change structure without changing the identity definition.
+ALTER TABLE lab.identity_events ADD COLUMN note text;
+-- The script waits until note exists on the target before continuing.
+
+SELECT setval('lab.identity_events_id_seq', 2000, true);
+INSERT INTO lab.identity_events (payload, note)
+VALUES ('after-ddl', 'DDL arrived');
+-- Source: id=2001. Observed target: id=1002 instead.
+```
+
+The source-side `setval` calls deliberately create gaps; they do not create
+DDL events. Using consecutive IDs here could hide a target generating its
+own ID instead of preserving the source ID.
+
+The observed result is **more than a lagging sequence**. The DDL refresh also
+classifies identity columns as generated, so the insert adapter can omit the
+source ID. The target then generates 1002 itself. Meanwhile, the empty sequence
+mapping means no corrective `setval` is emitted for that identity column.
+Both databases contain the row with payload `after-ddl`, but its ID differs.
+
+The script then restarts only the writer, generates source ID 3001, and checks
+that this new row and the target sequence both reach 3001. It also asserts
+that the earlier `after-ddl` row is **still 1002 on the target**. Restarting
+demonstrates the different behavior of fresh caches; it does not repair data.
+
+These are real end-to-end observations, not direct inspection of Go's in-memory
+maps. The cache explanation comes from the observer/adapter code and the
+focused unit test that shows the identity mapping being replaced with `{}`.
+The reproduction asserts the exact observed bug signature and exits nonzero
+if it changes, including if a future writer correctly preserves ID 2001.
 
 ## Why the snapshot worked
 
