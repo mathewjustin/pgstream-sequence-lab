@@ -148,6 +148,139 @@ exact disk-usage measurement or proof of target application. An inactive slot
 can still retain WAL; monitor this separately from Kafka consumer lag and
 target correctness. See [logical replication slots](https://www.postgresql.org/docs/16/logicaldecoding-explanation.html#LOGICALDECODING-REPLICATION-SLOTS).
 
+## Prerequisite: what is the schema observer?
+
+The schema observer is a Go component inside pgstream's PostgreSQL writer.
+It is not another Docker container or a service installed inside PostgreSQL.
+Think of it as the writer's in-memory notebook about the database structure.
+
+A row event tells the writer what data changed, for example `id = 1001`.
+To turn that event into valid target SQL, the writer also needs to understand
+the table: which columns PostgreSQL computes, which columns use sequences,
+and which types need special handling. Those facts are **schema metadata**.
+
+### Where it fits inside the writer
+
+```text
+Kafka event arrives at the pgstream writer
+    |
+    v
+Event adapter: is this a row change or a schema change?
+    |
+    +-- Row change (DML)
+    |     -> ask schema observer for table metadata
+    |     -> DML adapter uses that metadata to build SQL
+    |     -> writer executes the SQL on target PostgreSQL
+    |
+    +-- Schema change (DDL)
+          -> update or invalidate observer metadata
+          -> prepare target DDL when DDL execution is enabled
+          -> writer executes the prepared DDL
+```
+
+**DML** means data changes such as `INSERT`, `UPDATE`, and `DELETE`.
+**DDL** means structure changes such as `CREATE TABLE` and `ALTER TABLE`.
+The observer reacts to schema events passed through pgstream; its name does
+not mean it continuously polls every target table for changes.
+
+The observer supplies metadata. The DML adapter constructs statements such
+as `INSERT` and `setval`; the writer's execution machinery sends those
+statements to PostgreSQL. These are separate responsibilities within the
+writer process.
+
+### What the notebook contains
+
+The observer holds several caches, not just the sequence mapping:
+
+| Metadata | Why the writer needs it |
+| --- | --- |
+| Generated columns | Omit values that PostgreSQL must compute itself |
+| `GENERATED ALWAYS AS IDENTITY` columns | Avoid unsupported explicit assignments in UPDATE statements |
+| Column-to-sequence mappings | Generate sequence updates alongside replicated inserts |
+| Enum column information | Handle database-specific enum types when building or encoding writes |
+| Materialized views | Recognize objects the writer should not treat as ordinary writable tables |
+
+For sequences, a notebook entry looks like this:
+
+```text
+Table:    "lab"."events"
+Mapping:  "id" -> "lab"."id_sequence"
+```
+
+The observer discovers this relationship from PostgreSQL's **system catalogs**:
+tables describing database objects and their relationships. For example,
+`pg_attribute` describes columns, `pg_attrdef` stores default expressions,
+and `pg_depend` records dependencies between objects.
+
+The target catalogs and incoming schema-event metadata are distinct sources
+of information. The two paths in the next section explain how each can
+populate the same sequence cache.
+
+### Why cache it, and what does a cache hit mean?
+
+Looking up the same table's structure for every replicated row would repeatedly
+query PostgreSQL. Instead, the observer remembers the answer and reuses it.
+These caches belong to the running writer process; they are not persisted
+in Kafka or shared automatically between writer instances.
+
+There are three important states:
+
+| Cache state for a table | Meaning to the current sequence lookup |
+| --- | --- |
+| No entry | Metadata is unknown; query the target catalogs |
+| Entry containing a mapping | Reuse the known sequence mapping |
+| Entry containing an empty map `{}` | Reuse the answer that no sequence columns were found |
+
+An empty answer is still a **cache hit**. It does not cause another catalog
+query. If a refresh mistakenly stores `{}`, subsequent rows can keep using
+that incorrect answer even though the target database has a sequence.
+
+**Refresh** means replacing a cached answer with newly computed metadata.
+**Invalidation** means removing the answer so the next lookup must discover
+it again. Neither is inherently sufficient: a refresh must include all needed
+metadata, and a lookup after invalidation must observe the correct schema state.
+
+### Why schema changes need special care
+
+A table's structure can change while CDC runs. Remembering its original
+structure forever would leave the writer using stale metadata. That is why
+the observer also processes DDL events.
+
+In the reviewed code, the event adapter updates observer state while preparing
+a DDL event, before the resulting SQL is executed on the target. Therefore,
+replacing an event-based refresh with a live catalog query is not automatically
+safe: the target may still have the old structure at that point. Any such
+change needs to verify execution ordering and when subsequent rows obtain
+their metadata.
+
+Sequence metadata also interacts with the other caches. In this code,
+`updateGeneratedColumnNames` uses `DDLColumn.IsGenerated()`, which includes
+identity columns. The DML adapter filters those columns from inserted values.
+Consequently, a test after DDL must verify that the target preserves the
+**source row's actual ID**, as well as checking sequence state. Consecutive
+IDs alone can hide the target accidentally generating a matching ID itself.
+
+These are implementation details to account for when designing a fix, not
+additional scenarios already covered by the current lab workload.
+
+### Local code-reading landmarks
+
+The relevant functions are under `pkg/wal/processor/postgres/` in pgstream:
+
+- `postgres_wal_adapter.go`: `walEventToQueries` and `walEventToMessage`
+  route events and call the observer.
+- `postgres_schema_observer.go`: `getSchemaInfo` gathers metadata;
+  `getSequenceColumns` reads or populates the sequence cache; `update`
+  handles schema-event metadata.
+- `postgres_wal_dml_adapter.go`: `buildInsertQueries` uses that metadata
+  to construct row inserts and sequence updates.
+- `postgres_wal_dml_adapter_bulk.go`: `buildBulkInsertQueries` handles
+  groups of inserts and their sequence updates.
+
+The DDL column helpers, including `GetSequenceName` and `IsGenerated`, live
+in `pkg/wal/wal_ddl.go`. This walkthrough was checked against the local PR
+checkout at `c36b327`; the runnable lab builds `v1.3.1` plus its bundled patch.
+
 ## The schema observer has two sequence-metadata paths
 
 The PostgreSQL writer does not inspect the database catalogs for every row. Its
