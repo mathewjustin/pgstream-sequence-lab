@@ -154,6 +154,31 @@ The schema observer is a Go component inside pgstream's PostgreSQL writer.
 It is not another Docker container or a service installed inside PostgreSQL.
 Think of it as the writer's in-memory notebook about the database structure.
 
+> **Its job is to give the PostgreSQL writer the structural knowledge it needs
+> to turn incoming changes into appropriate target SQL.** It discovers and
+> caches table metadata, and processes schema-change events to keep that
+> knowledge current. The writer uses this information to decide which column
+> values to write, which require special handling, and which sequences need
+> updating alongside inserts.
+
+The design serves three purposes: **correctness**, by giving SQL generation
+the metadata that row values alone do not provide; **efficiency**, by reusing
+cached answers instead of repeating catalog queries for every row; and
+**separation of responsibilities**, by keeping metadata discovery apart from
+SQL construction and execution. This describes its role in the implementation,
+rather than a claim about the original authors' design history.
+
+For example, an event containing `id = 1001` does not tell the writer that
+`lab.id_sequence` also needs attention. The observer supplies the mapping
+from `id` to that sequence. The DML adapter then builds the explicit-ID insert
+and the associated `setval` statement, and the writer executes them.
+
+That is why the original fix belongs here: **the writer already knew how to
+update a sequence, but discovery failed to tell it which sequence to update.**
+The observer's intended contract includes keeping that mapping correct after
+schema changes too; the two paths below explain where that contract currently
+breaks down.
+
 A row event tells the writer what data changed, for example `id = 1001`.
 To turn that event into valid target SQL, the writer also needs to understand
 the table: which columns PostgreSQL computes, which columns use sequences,
