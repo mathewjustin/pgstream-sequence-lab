@@ -268,6 +268,65 @@ has the first, so the query missed a sequence that the column really uses.
 The patch follows the first relationship and verifies that the default is
 exactly a direct `nextval` expression.
 
+### Why would someone use OWNED BY?
+
+Think of it as saying: **“This number generator belongs to this column's
+lifecycle. Manage them together.”** It is useful when a sequence exists
+solely to generate IDs for one column.
+
+For example, if `orders_id_seq` serves only `orders.id`, keeping it after
+removing the orders table would leave an unused database object. With
+`OWNED BY orders.id`, dropping the column or table automatically removes
+its sequence too. The table and sequence must be in the same schema and
+have the same database-role owner. See PostgreSQL's
+[`OWNED BY` documentation](https://www.postgresql.org/docs/16/sql-createsequence.html).
+
+Ownership also affects resetting a table for a fresh start:
+
+```sql
+-- Destructive example only: empties the table. Not a lab setup step.
+TRUNCATE lab.events RESTART IDENTITY;
+```
+
+`RESTART IDENTITY` restarts sequences **owned by** columns of that table.
+It does not restart an unowned sequence just because a column default calls
+it. Plain `TRUNCATE` defaults to `CONTINUE IDENTITY`, which leaves sequence
+values unchanged. See [PostgreSQL TRUNCATE](https://www.postgresql.org/docs/16/sql-truncate.html).
+
+| Operation | Sequence owned by this column | Unowned sequence used by its default |
+| --- | --- | --- |
+| Drop the table, assuming no other dependencies block it | Sequence is dropped with it | Sequence remains |
+| `TRUNCATE ... RESTART IDENTITY` | Sequence is restarted | Sequence is not restarted by this operation |
+| Insert an explicit ID, such as `id = 100` | Does not advance the sequence | Does not advance the sequence |
+
+### Why deliberately leave a sequence unowned?
+
+Imagine two tables using a common ticket-number generator:
+
+```text
+online_orders.id ── default calls ──┐
+                                   ├── shared_ticket_sequence
+store_orders.id  ── default calls ──┘
+```
+
+Tying that sequence's lifetime to just `online_orders.id` would make removal
+of that table affect a generator still needed by `store_orders`. Leaving it
+unowned lets the application or migration scripts manage its lifetime
+independently. This is a PostgreSQL design example, not a claim that this
+lab tests shared-sequence replication.
+
+A sequence may also be managed separately from tables, or referenced from
+another schema. A direct `nextval` default remains valid without an ownership
+link. “Unowned” here only means not owned by a **column**; the sequence still
+has a database role as its owner.
+
+For our bug, adding `OWNED BY` would supply the relationship the old discovery
+query expected, but would also change the schema's lifecycle behavior. It is
+not a universal substitute for fixing discovery. pgstream must recognize the
+valid unowned direct-default case too. Ownership itself never keeps a target
+sequence synchronized with explicitly replicated IDs; the writer still needs
+its separate sequence-update logic.
+
 ### How PostgreSQL describes this in its catalogs
 
 PostgreSQL maintains system tables describing the objects you create. You
