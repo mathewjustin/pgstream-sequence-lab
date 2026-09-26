@@ -200,17 +200,111 @@ The observer holds several caches, not just the sequence mapping:
 | Enum column information | Handle database-specific enum types when building or encoding writes |
 | Materialized views | Recognize objects the writer should not treat as ordinary writable tables |
 
-For sequences, a notebook entry looks like this:
+### A concrete example: what belongs to what?
+
+Start with the SQL in this lab's [`db/seed.sql`](db/seed.sql):
+
+```sql
+CREATE SCHEMA lab;
+CREATE SEQUENCE lab.id_sequence;
+
+CREATE TABLE lab.events (
+    id bigint PRIMARY KEY DEFAULT nextval('lab.id_sequence'::regclass),
+    payload text NOT NULL
+);
+```
+
+Read the names from left to right:
+
+- `lab` is a schema: a namespace for database objects.
+- `lab.events` is a table in that schema. `id` and `payload` are its columns.
+- `lab.id_sequence` is a separate sequence in the same schema. It is not
+  stored inside the table or the `id` column.
+- The **default attached to `id`** calls that sequence when an insert omits
+  the ID. A primary key enforces uniqueness; it does not itself generate IDs.
+
+![Illustration showing the lab's table and separate sequence, the default dependency, optional sequence ownership, and the mapping cached by pgstream.](docs/images/sequence-relationships.svg)
+
+*This is an explanatory illustration, not captured database output.
+[Open the full-size diagram](docs/images/sequence-relationships.svg).*
+
+On a fresh database, before seeding any rows:
+
+```sql
+INSERT INTO lab.events (payload) VALUES ('hello') RETURNING id;
+-- Returns 1: the default called nextval.
+
+INSERT INTO lab.events (id, payload) VALUES (100, 'copied row');
+-- Stores 100 explicitly: the default is not called.
+-- The sequence is still at 1 in this example.
+```
+
+This is why copying a row and advancing a sequence are separate jobs.
+
+### “Uses this sequence” is different from “owns this sequence”
+
+Our lab's default **uses** `lab.id_sequence`, but the sequence is not
+**owned by** `lab.events.id`. PostgreSQL allows this arrangement.
+
+For comparison, this additional statement would establish ownership:
+
+```sql
+-- Illustration only: do not add this to the reproduction setup.
+ALTER SEQUENCE lab.id_sequence OWNED BY lab.events.id;
+```
+
+It adds a lifecycle relationship: dropping the owning column or its table
+also drops the owned sequence. It does not create the `nextval` default;
+that default already exists in our example. Here, “owned by” means a
+sequence-to-column relationship, not the database role that owns an object.
+
+| Relationship | In the original lab? | What it means |
+| --- | --- | --- |
+| Default → sequence | Yes | The default expression depends on the sequence it calls |
+| Sequence → owning column | No | If added, the sequence belongs to that column's lifecycle |
+
+The old discovery query searched for the second relationship. Our lab only
+has the first, so the query missed a sequence that the column really uses.
+The patch follows the first relationship and verifies that the default is
+exactly a direct `nextval` expression.
+
+### How PostgreSQL describes this in its catalogs
+
+PostgreSQL maintains system tables describing the objects you create. You
+write `CREATE TABLE`; PostgreSQL creates the corresponding catalog records.
+The observer reads those records to discover relationships.
+
+This is a simplified view of the relevant records, **not literal query output**:
+
+| Catalog | Facts recorded for this example |
+| --- | --- |
+| `pg_namespace` | A schema named `lab` exists |
+| `pg_class` | `events` is a table; `id_sequence` is a sequence; both belong to `lab` |
+| `pg_attribute` | Table `events` has columns `id` and `payload` |
+| `pg_attrdef` | The default for `events.id` is `nextval('lab.id_sequence'::regclass)` |
+| `pg_depend` | That default depends on the sequence: a normal dependency, `n` |
+
+Real catalog records connect objects using internal numeric identifiers
+called **OIDs**, plus column numbers where needed. The observer joins these
+records and resolves them into names. It does not infer ownership from a
+name such as `id_sequence`.
+
+For an ordinary `OWNED BY` relationship, `pg_depend` would also contain an
+automatic dependency, `a`, from the sequence to the column. Identity columns
+have a different internal relationship, `i`, explained in the two-path section.
+
+### What ends up in pgstream's notebook?
+
+After discovering our direct-default relationship, the observer stores:
 
 ```text
 Table:    "lab"."events"
 Mapping:  "id" -> "lab"."id_sequence"
 ```
 
-The observer discovers this relationship from PostgreSQL's **system catalogs**:
-tables describing database objects and their relationships. For example,
-`pg_attribute` describes columns, `pg_attrdef` stores default expressions,
-and `pg_depend` records dependencies between objects.
+Read that as: “When writing an ID to `lab.events`, the associated sequence
+is `lab.id_sequence`.” This is an in-memory lookup in the writer process;
+it is not a new ownership relationship in PostgreSQL.
 
 The target catalogs and incoming schema-event metadata are distinct sources
 of information. The two paths in the next section explain how each can

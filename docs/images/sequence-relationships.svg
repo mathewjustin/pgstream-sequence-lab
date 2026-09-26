@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="820" viewBox="0 0 1000 820" role="img" aria-labelledby="title desc">
+  <title id="title">Using a sequence does not mean owning it</title>
+  <desc id="desc">In the lab schema, events is a table with an id column whose default calls the separate id_sequence object. PostgreSQL records a normal dependency from the default to the sequence. Adding OWNED BY adds an automatic dependency in the opposite direction, from the sequence to the column. The pgstream writer caches a column-to-sequence mapping from these catalogs.</desc>
+  <defs>
+    <marker id="blue" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#2563eb"/></marker>
+    <marker id="orange" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#b45309"/></marker>
+    <style>
+      text { font-family: DejaVu Sans, sans-serif; fill: #17233b; }
+      .heading { font-size: 25px; font-weight: bold; }
+      .label { font-size: 19px; font-weight: bold; }
+      .body { font-size: 17px; }
+      .small { font-size: 15px; fill: #475569; }
+      .code { font-family: DejaVu Sans Mono, monospace; font-size: 16px; }
+    </style>
+  </defs>
+  <rect width="1000" height="820" rx="16" fill="#f8fafc"/>
+  <text x="32" y="43" class="heading">Using a sequence ≠ owning a sequence</text>
+  <text x="32" y="72" class="small">Illustration of the lab schema and catalog relationships · not a database screenshot</text>
+
+  <rect x="24" y="96" width="952" height="320" rx="12" fill="#fff" stroke="#cbd5e1"/>
+  <text x="44" y="129" class="label">1. Our lab: two separate objects inside the schema named lab</text>
+  <rect x="44" y="150" width="520" height="172" rx="8" fill="#eff6ff" stroke="#93c5fd"/>
+  <text x="62" y="179" class="label">TABLE  lab.events</text>
+  <text x="62" y="210" class="code">id       bigint PRIMARY KEY</text>
+  <text x="62" y="237" class="code">payload  text</text>
+  <rect x="58" y="253" width="492" height="52" rx="6" fill="#dbeafe"/>
+  <text x="70" y="274" class="small">Default attached to id:</text>
+  <text x="70" y="295" class="code">nextval('lab.id_sequence'::regclass)</text>
+  <rect x="665" y="150" width="289" height="172" rx="8" fill="#f0fdf4" stroke="#86efac"/>
+  <text x="683" y="179" class="label">SEQUENCE</text>
+  <text x="683" y="210" class="code">lab.id_sequence</text>
+  <text x="683" y="244" class="body">Allocates the next number</text>
+  <text x="683" y="273" class="small">Separate from the table</text>
+  <text x="683" y="298" class="small">Not inside the id column</text>
+  <path d="M552 280 L654 280" stroke="#2563eb" stroke-width="3" fill="none" marker-end="url(#blue)"/>
+  <text x="578" y="263" class="small">calls</text>
+  <text x="44" y="356" class="body">Default → sequence: normal dependency (n), recorded in pg_depend.</text>
+  <text x="44" y="387" class="body">There is no OWNED BY link in this lab. The default still works.</text>
+
+  <rect x="24" y="434" width="952" height="188" rx="12" fill="#fffbeb" stroke="#fcd34d"/>
+  <text x="44" y="467" class="label">2. If we added OWNED BY: an extra relationship</text>
+  <text x="44" y="499" class="code">ALTER SEQUENCE lab.id_sequence OWNED BY lab.events.id;</text>
+  <text x="58" y="546" class="code">lab.events.id</text>
+  <path d="M669 540 L290 540" stroke="#b45309" stroke-width="3" fill="none" marker-end="url(#orange)"/>
+  <text x="710" y="546" class="code">lab.id_sequence</text>
+  <text x="332" y="529" class="small">sequence is owned by column (a)</text>
+  <text x="44" y="585" class="body">The default link remains. Ownership additionally ties the sequence's lifetime to the column.</text>
+
+  <rect x="24" y="640" width="952" height="156" rx="12" fill="#eef2ff" stroke="#a5b4fc"/>
+  <text x="44" y="675" class="label">3. What pgstream remembers in its writer process</text>
+  <text x="44" y="710" class="code">Table: "lab"."events"    Mapping: "id" → "lab"."id_sequence"</text>
+  <text x="44" y="743" class="body">Old lookup: searches for ownership (a) → misses the lab's sequence.</text>
+  <text x="44" y="776" class="body">Patched lookup: follows the direct default dependency → finds the sequence.</text>
+</svg>
